@@ -1,0 +1,1377 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+var StringDecoder = require('string_decoder').StringDecoder;
+var EventEmitter = require('events').EventEmitter;
+var net = require('net');
+var dgram = require('dgram');
+var assert = require('assert');
+var util = require('util');
+
+var Process = process.binding('process_wrap').Process;
+var uv = process.binding('uv');
+
+var spawn_sync; 
+var constants;  
+
+var errnoException = util._errnoException;
+var handleWraps = {};
+
+function handleWrapGetter(name, callback) {
+  var cons;
+
+  Object.defineProperty(handleWraps, name, {
+    get: function() {
+      if (!util.isUndefined(cons)) return cons;
+      return cons = callback();
+    }
+  });
+}
+
+handleWrapGetter('Pipe', function() {
+  return process.binding('pipe_wrap').Pipe;
+});
+
+handleWrapGetter('TTY', function() {
+  return process.binding('tty_wrap').TTY;
+});
+
+handleWrapGetter('TCP', function() {
+  return process.binding('tcp_wrap').TCP;
+});
+
+handleWrapGetter('UDP', function() {
+  return process.binding('udp_wrap').UDP;
+});
+
+
+function createPipe(ipc) {
+  return new handleWraps.Pipe(ipc);
+}
+
+function createSocket(pipe, readable) {
+  var s = new net.Socket({ handle: pipe });
+
+  if (readable) {
+    s.writable = false;
+    s.readable = true;
+  } else {
+    s.writable = true;
+    s.readable = false;
+  }
+
+  return s;
+}
+
+
+
+
+var handleConversion = {
+  'net.Native': {
+    simultaneousAccepts: true,
+
+    send: function(message, handle) {
+      return handle;
+    },
+
+    got: function(message, handle, emit) {
+      emit(handle);
+    }
+  },
+
+  'net.Server': {
+    simultaneousAccepts: true,
+
+    send: function(message, server) {
+      return server._handle;
+    },
+
+    got: function(message, handle, emit) {
+      var server = new net.Server();
+      server.listen(handle, function() {
+        emit(server);
+      });
+    }
+  },
+
+  'net.Socket': {
+    send: function(message, socket) {
+      if (!socket._handle)
+        return;
+
+      
+      if (socket.server) {
+        
+        message.key = socket.server._connectionKey;
+
+        var firstTime = !this._channel.sockets.send[message.key];
+        var socketList = getSocketList('send', this, message.key);
+
+        
+        
+        
+        if (firstTime) socket.server._setupSlave(socketList);
+
+        
+        socket.server._connections--;
+      }
+
+      
+      
+      var handle = socket._handle;
+      handle.onread = function() {};
+      socket._handle = null;
+
+      return handle;
+    },
+
+    postSend: function(handle) {
+      
+      if (handle)
+        handle.close();
+    },
+
+    got: function(message, handle, emit) {
+      var socket = new net.Socket({handle: handle});
+      socket.readable = socket.writable = true;
+
+      
+      if (message.key) {
+
+        
+        var socketList = getSocketList('got', this, message.key);
+        socketList.add({
+          socket: socket
+        });
+      }
+
+      emit(socket);
+    }
+  },
+
+  'dgram.Native': {
+    simultaneousAccepts: false,
+
+    send: function(message, handle) {
+      return handle;
+    },
+
+    got: function(message, handle, emit) {
+      emit(handle);
+    }
+  },
+
+  'dgram.Socket': {
+    simultaneousAccepts: false,
+
+    send: function(message, socket) {
+      message.dgramType = socket.type;
+
+      return socket._handle;
+    },
+
+    got: function(message, handle, emit) {
+      var socket = new dgram.Socket(message.dgramType);
+
+      socket.bind(handle, function() {
+        emit(socket);
+      });
+    }
+  }
+};
+
+
+function SocketListSend(slave, key) {
+  EventEmitter.call(this);
+
+  this.key = key;
+  this.slave = slave;
+}
+util.inherits(SocketListSend, EventEmitter);
+
+SocketListSend.prototype._request = function(msg, cmd, callback) {
+  var self = this;
+
+  if (!this.slave.connected) return onclose();
+  this.slave.send(msg);
+
+  function onclose() {
+    self.slave.removeListener('internalMessage', onreply);
+    callback(new Error('Slave closed before reply'));
+  };
+
+  function onreply(msg) {
+    if (!(msg.cmd === cmd && msg.key === self.key)) return;
+    self.slave.removeListener('disconnect', onclose);
+    self.slave.removeListener('internalMessage', onreply);
+
+    callback(null, msg);
+  };
+
+  this.slave.once('disconnect', onclose);
+  this.slave.on('internalMessage', onreply);
+};
+
+SocketListSend.prototype.close = function close(callback) {
+  this._request({
+    cmd: 'NODE_SOCKET_NOTIFY_CLOSE',
+    key: this.key
+  }, 'NODE_SOCKET_ALL_CLOSED', callback);
+};
+
+SocketListSend.prototype.getConnections = function getConnections(callback) {
+  this._request({
+    cmd: 'NODE_SOCKET_GET_COUNT',
+    key: this.key
+  }, 'NODE_SOCKET_COUNT', function(err, msg) {
+    if (err) return callback(err);
+    callback(null, msg.count);
+  });
+};
+
+
+function SocketListReceive(slave, key) {
+  EventEmitter.call(this);
+
+  var self = this;
+
+  this.connections = 0;
+  this.key = key;
+  this.slave = slave;
+
+  function onempty() {
+    if (!self.slave.connected) return;
+
+    self.slave.send({
+      cmd: 'NODE_SOCKET_ALL_CLOSED',
+      key: self.key
+    });
+  }
+
+  this.slave.on('internalMessage', function(msg) {
+    if (msg.key !== self.key) return;
+
+    if (msg.cmd === 'NODE_SOCKET_NOTIFY_CLOSE') {
+      
+      if (self.connections === 0) return onempty();
+
+      
+      self.once('empty', onempty);
+    } else if (msg.cmd === 'NODE_SOCKET_GET_COUNT') {
+      if (!self.slave.connected) return;
+      self.slave.send({
+        cmd: 'NODE_SOCKET_COUNT',
+        key: self.key,
+        count: self.connections
+      });
+    }
+  });
+}
+util.inherits(SocketListReceive, EventEmitter);
+
+SocketListReceive.prototype.add = function(obj) {
+  var self = this;
+
+  this.connections++;
+
+  
+  obj.socket.once('close', function() {
+    self.connections--;
+
+    if (self.connections === 0) self.emit('empty');
+  });
+};
+
+function getSocketList(type, slave, key) {
+  var sockets = slave._channel.sockets[type];
+  var socketList = sockets[key];
+  if (!socketList) {
+    var Construct = type === 'send' ? SocketListSend : SocketListReceive;
+    socketList = sockets[key] = new Construct(slave, key);
+  }
+  return socketList;
+}
+
+var INTERNAL_PREFIX = 'NODE_';
+function handleMessage(target, message, handle) {
+  var eventName = 'message';
+  if (!util.isNull(message) &&
+      util.isObject(message) &&
+      util.isString(message.cmd) &&
+      message.cmd.length > INTERNAL_PREFIX.length &&
+      message.cmd.slice(0, INTERNAL_PREFIX.length) === INTERNAL_PREFIX) {
+    eventName = 'internalMessage';
+  }
+  target.emit(eventName, message, handle);
+}
+
+function setupChannel(target, channel) {
+  target._channel = channel;
+  target._handleQueue = null;
+
+  var decoder = new StringDecoder('utf8');
+  var jsonBuffer = '';
+  channel.buffering = false;
+  channel.onread = function(nread, pool, recvHandle) {
+    
+    if (pool) {
+      jsonBuffer += decoder.write(pool);
+
+      var i, start = 0;
+
+      
+      while ((i = jsonBuffer.indexOf('\n', start)) >= 0) {
+        var json = jsonBuffer.slice(start, i);
+        var message = JSON.parse(json);
+
+        
+        
+        
+        if (message && message.cmd === 'NODE_HANDLE')
+          handleMessage(target, message, recvHandle);
+        else
+          handleMessage(target, message, undefined);
+
+        start = i + 1;
+      }
+      jsonBuffer = jsonBuffer.slice(start);
+      this.buffering = jsonBuffer.length !== 0;
+
+    } else {
+      this.buffering = false;
+      target.disconnect();
+      channel.onread = nop;
+      channel.close();
+      maybeClose(target);
+    }
+  };
+
+  
+  channel.sockets = { got: {}, send: {} };
+
+  
+  target.on('internalMessage', function(message, handle) {
+    
+    if (message.cmd === 'NODE_HANDLE_ACK') {
+      assert(util.isArray(target._handleQueue));
+      var queue = target._handleQueue;
+      target._handleQueue = null;
+
+      queue.forEach(function(args) {
+        target._send(args.message, args.handle, false);
+      });
+
+      
+      if (!target.connected && target._channel && !target._handleQueue)
+        target._disconnect();
+
+      return;
+    }
+
+    if (message.cmd !== 'NODE_HANDLE') return;
+
+    
+    
+    
+    
+    target._send({ cmd: 'NODE_HANDLE_ACK' }, null, true);
+
+    var obj = handleConversion[message.type];
+
+    
+    if (process.platform === 'win32') {
+      handle._simultaneousAccepts = false;
+      net._setSimultaneousAccepts(handle);
+    }
+
+    
+    obj.got.call(this, message, handle, function(handle) {
+      handleMessage(target, message.msg, handle);
+    });
+  });
+
+  target.send = function(message, handle) {
+    if (!this.connected)
+      this.emit('error', new Error('channel closed'));
+    else
+      this._send(message, handle, false);
+  };
+
+  target._send = function(message, handle, swallowErrors) {
+    assert(this.connected || this._channel);
+
+    if (util.isUndefined(message))
+      throw new TypeError('message cannot be undefined');
+
+    
+    if (handle) {
+      
+      message = {
+        cmd: 'NODE_HANDLE',
+        type: null,
+        msg: message
+      };
+
+      if (handle instanceof net.Socket) {
+        message.type = 'net.Socket';
+      } else if (handle instanceof net.Server) {
+        message.type = 'net.Server';
+      } else if (handle instanceof process.binding('tcp_wrap').TCP ||
+                 handle instanceof process.binding('pipe_wrap').Pipe) {
+        message.type = 'net.Native';
+      } else if (handle instanceof dgram.Socket) {
+        message.type = 'dgram.Socket';
+      } else if (handle instanceof process.binding('udp_wrap').UDP) {
+        message.type = 'dgram.Native';
+      } else {
+        throw new TypeError("This handle type can't be sent");
+      }
+
+      
+      if (this._handleQueue) {
+        this._handleQueue.push({ message: message.msg, handle: handle });
+        return;
+      }
+
+      var obj = handleConversion[message.type];
+
+      
+      handle =
+          handleConversion[message.type].send.call(target, message, handle);
+
+      
+      
+      if (!handle)
+        message = message.msg;
+
+      
+      if (obj.simultaneousAccepts) {
+        net._setSimultaneousAccepts(handle);
+      }
+    } else if (this._handleQueue &&
+               !(message && message.cmd === 'NODE_HANDLE_ACK')) {
+      
+      this._handleQueue.push({ message: message, handle: null });
+      return;
+    }
+
+    var req = { oncomplete: nop };
+    var string = JSON.stringify(message) + '\n';
+    var err = channel.writeUtf8String(req, string, handle);
+
+    if (err) {
+      if (!swallowErrors)
+        this.emit('error', errnoException(err, 'write'));
+    } else if (handle && !this._handleQueue) {
+      this._handleQueue = [];
+    }
+
+    if (obj && obj.postSend) {
+      req.oncomplete = obj.postSend.bind(null, handle);
+    }
+
+    
+    return channel.writeQueueSize < (65536 * 2);
+  };
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  target.connected = true;
+
+  target.disconnect = function() {
+    if (!this.connected) {
+      this.emit('error', new Error('IPC channel is already disconnected'));
+      return;
+    }
+
+    
+    this.connected = false;
+
+    
+    
+    
+    if (!this._handleQueue)
+      this._disconnect();
+  };
+
+  target._disconnect = function() {
+    assert(this._channel);
+
+    
+    this._channel = null;
+
+    var fired = false;
+    function finish() {
+      if (fired) return;
+      fired = true;
+
+      channel.close();
+      target.emit('disconnect');
+    }
+
+    
+    if (channel.buffering) {
+      this.once('message', finish);
+      this.once('internalMessage', finish);
+
+      return;
+    }
+
+    process.nextTick(finish);
+  };
+
+  channel.readStart();
+}
+
+
+function nop() { }
+
+exports.fork = function(modulePath ) {
+
+  
+  var options, args, execArgv;
+  if (util.isArray(arguments[1])) {
+    args = arguments[1];
+    options = util._extend({}, arguments[2]);
+  } else {
+    args = [];
+    options = util._extend({}, arguments[1]);
+  }
+
+  
+  execArgv = options.execArgv || process.execArgv;
+  args = execArgv.concat([modulePath], args);
+
+  
+  
+  options.stdio = options.silent ? ['pipe', 'pipe', 'pipe', 'ipc'] :
+      [0, 1, 2, 'ipc'];
+
+  options.execPath = options.execPath || process.execPath;
+
+  return spawn(options.execPath, args, options);
+};
+
+
+exports._forkChild = function(fd) {
+  
+  var p = createPipe(true);
+  p.open(fd);
+  p.unref();
+  setupChannel(process, p);
+
+  var refs = 0;
+  process.on('newListener', function(name) {
+    if (name !== 'message' && name !== 'disconnect') return;
+    if (++refs === 1) p.ref();
+  });
+  process.on('removeListener', function(name) {
+    if (name !== 'message' && name !== 'disconnect') return;
+    if (--refs === 0) p.unref();
+  });
+};
+
+
+function normalizeExecArgs(command ) {
+  var file, args, options, callback;
+
+  if (util.isFunction(arguments[1])) {
+    options = undefined;
+    callback = arguments[1];
+  } else {
+    options = arguments[1];
+    callback = arguments[2];
+  }
+
+  if (process.platform === 'win32') {
+    file = process.env.comspec || 'cmd.exe';
+    args = ['/s', '/c', '"' + command + '"'];
+    
+    
+    options = util._extend({}, options);
+    options.windowsVerbatimArguments = true;
+  } else {
+    file = '/bin/sh';
+    args = ['-c', command];
+  }
+
+  if (options && options.shell)
+    file = options.shell;
+
+  return {
+    cmd: command,
+    file: file,
+    args: args,
+    options: options,
+    callback: callback
+  };
+}
+
+
+exports.exec = function(command ) {
+  var opts = normalizeExecArgs.apply(null, arguments);
+  return exports.execFile(opts.file,
+                          opts.args,
+                          opts.options,
+                          opts.callback);
+};
+
+
+exports.execFile = function(file ) {
+  var args, callback;
+  var options = {
+    encoding: 'utf8',
+    timeout: 0,
+    maxBuffer: 200 * 1024,
+    killSignal: 'SIGTERM',
+    cwd: null,
+    env: null
+  };
+
+  
+
+  if (util.isFunction(arguments[arguments.length - 1])) {
+    callback = arguments[arguments.length - 1];
+  }
+
+  if (util.isArray(arguments[1])) {
+    args = arguments[1];
+    options = util._extend(options, arguments[2]);
+  } else {
+    args = [];
+    options = util._extend(options, arguments[1]);
+  }
+
+  var child = spawn(file, args, {
+    cwd: options.cwd,
+    env: options.env,
+    gid: options.gid,
+    uid: options.uid,
+    windowsVerbatimArguments: !!options.windowsVerbatimArguments
+  });
+
+  var encoding;
+  var _stdout;
+  var _stderr;
+  if (options.encoding !== 'buffer' && Buffer.isEncoding(options.encoding)) {
+    encoding = options.encoding;
+    _stdout = '';
+    _stderr = '';
+  } else {
+    _stdout = [];
+    _stderr = [];
+    encoding = null;
+  }
+  var stdoutLen = 0;
+  var stderrLen = 0;
+  var killed = false;
+  var exited = false;
+  var timeoutId;
+
+  var ex = null;
+
+  function exithandler(code, signal) {
+    if (exited) return;
+    exited = true;
+
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+
+    if (!callback) return;
+
+    
+    var stdout;
+    var stderr;
+    if (!encoding) {
+      stdout = Buffer.concat(_stdout);
+      stderr = Buffer.concat(_stderr);
+    } else {
+      stdout = _stdout;
+      stderr = _stderr;
+    }
+
+    if (ex) {
+      
+    } else if (code === 0 && signal === null) {
+      callback(null, stdout, stderr);
+      return;
+    }
+
+    var cmd = file;
+    if (args.length !== 0)
+      cmd += ' ' + args.join(' ');
+
+    if (!ex) {
+      ex = new Error('Command failed: ' + cmd + '\n' + stderr);
+      ex.killed = child.killed || killed;
+      ex.code = code < 0 ? uv.errname(code) : code;
+      ex.signal = signal;
+    }
+
+    ex.cmd = cmd;
+    callback(ex, stdout, stderr);
+  }
+
+  function errorhandler(e) {
+    ex = e;
+    child.stdout.destroy();
+    child.stderr.destroy();
+    exithandler();
+  }
+
+  function kill() {
+    child.stdout.destroy();
+    child.stderr.destroy();
+
+    killed = true;
+    try {
+      child.kill(options.killSignal);
+    } catch (e) {
+      ex = e;
+      exithandler();
+    }
+  }
+
+  if (options.timeout > 0) {
+    timeoutId = setTimeout(function() {
+      kill();
+      timeoutId = null;
+    }, options.timeout);
+  }
+
+  child.stdout.addListener('data', function(chunk) {
+    stdoutLen += chunk.length;
+
+    if (stdoutLen > options.maxBuffer) {
+      ex = new Error('stdout maxBuffer exceeded.');
+      kill();
+    } else {
+      if (!encoding)
+        _stdout.push(chunk);
+      else
+        _stdout += chunk;
+    }
+  });
+
+  child.stderr.addListener('data', function(chunk) {
+    stderrLen += chunk.length;
+
+    if (stderrLen > options.maxBuffer) {
+      ex = new Error('stderr maxBuffer exceeded.');
+      kill();
+    } else {
+      if (!encoding)
+        _stderr.push(chunk);
+      else
+        _stderr += chunk;
+    }
+  });
+
+  if (encoding) {
+    child.stderr.setEncoding(encoding);
+    child.stdout.setEncoding(encoding);
+  }
+
+  child.addListener('close', exithandler);
+  child.addListener('error', errorhandler);
+
+  return child;
+};
+
+var _deprecatedCustomFds = util.deprecate(function(options) {
+  options.stdio = options.customFds.map(function(fd) {
+    return fd === -1 ? 'pipe' : fd;
+  });
+}, 'child_process: customFds option is deprecated, use stdio instead.');
+
+function _convertCustomFds(options) {
+  if (options && options.customFds && !options.stdio) {
+    _deprecatedCustomFds(options);
+  }
+}
+
+
+function _validateStdio(stdio, sync) {
+  var ipc,
+      ipcFd;
+
+  
+  if (util.isString(stdio)) {
+    switch (stdio) {
+      case 'ignore': stdio = ['ignore', 'ignore', 'ignore']; break;
+      case 'pipe': stdio = ['pipe', 'pipe', 'pipe']; break;
+      case 'inherit': stdio = [0, 1, 2]; break;
+      default: throw new TypeError('Incorrect value of stdio option: ' + stdio);
+    }
+  } else if (!util.isArray(stdio)) {
+    throw new TypeError('Incorrect value of stdio option: ' +
+        util.inspect(stdio));
+  }
+
+  
+  
+  
+  
+  while (stdio.length < 3) stdio.push(undefined);
+
+  
+  
+  stdio = stdio.reduce(function(acc, stdio, i) {
+    function cleanup() {
+      acc.filter(function(stdio) {
+        return stdio.type === 'pipe' || stdio.type === 'ipc';
+      }).forEach(function(stdio) {
+        if (stdio.handle)
+          stdio.handle.close();
+      });
+    }
+
+    
+    if (util.isNullOrUndefined(stdio)) {
+      stdio = i < 3 ? 'pipe' : 'ignore';
+    }
+
+    if (stdio === null || stdio === 'ignore') {
+      acc.push({type: 'ignore'});
+    } else if (stdio === 'pipe' || util.isNumber(stdio) && stdio < 0) {
+      var a = {
+        type: 'pipe',
+        readable: i === 0,
+        writable: i !== 0
+      };
+
+      if (!sync)
+        a.handle = createPipe();
+
+      acc.push(a);
+    } else if (stdio === 'ipc') {
+      if (sync || !util.isUndefined(ipc)) {
+        
+        cleanup();
+        if (!sync)
+          throw Error('Child process can have only one IPC pipe');
+        else
+          throw Error('You cannot use IPC with synchronous forks');
+      }
+
+      ipc = createPipe(true);
+      ipcFd = i;
+
+      acc.push({
+        type: 'pipe',
+        handle: ipc,
+        ipc: true
+      });
+    } else if (stdio === 'inherit') {
+      acc.push({
+        type: 'inherit',
+        fd: i
+      });
+    } else if (util.isNumber(stdio) || util.isNumber(stdio.fd)) {
+      acc.push({
+        type: 'fd',
+        fd: stdio.fd || stdio
+      });
+    } else if (getHandleWrapType(stdio) || getHandleWrapType(stdio.handle) ||
+               getHandleWrapType(stdio._handle)) {
+      var handle = getHandleWrapType(stdio) ?
+          stdio :
+          getHandleWrapType(stdio.handle) ? stdio.handle : stdio._handle;
+
+      acc.push({
+        type: 'wrap',
+        wrapType: getHandleWrapType(handle),
+        handle: handle
+      });
+    } else if (util.isBuffer(stdio) || util.isString(stdio)) {
+      if (!sync) {
+        cleanup();
+        throw new TypeError('Asynchronous forks do not support Buffer input: ' +
+            util.inspect(stdio));
+      }
+    } else {
+      
+      cleanup();
+      throw new TypeError('Incorrect value for stdio stream: ' +
+          util.inspect(stdio));
+    }
+
+    return acc;
+  }, []);
+
+  return {stdio: stdio, ipc: ipc, ipcFd: ipcFd};
+}
+
+
+function normalizeSpawnArguments() {
+  var args, options;
+
+  var file = arguments[0];
+
+  if (Array.isArray(arguments[1])) {
+    args = arguments[1].slice(0);
+    options = arguments[2];
+  } else if (arguments[1] && !Array.isArray(arguments[1])) {
+    throw new TypeError('Incorrect value of args option');
+  } else {
+    args = [];
+    options = arguments[1];
+  }
+
+  if (!options)
+    options = {};
+
+  args.unshift(file);
+
+  var env = (options && options.env ? options.env : null) || process.env;
+  var envPairs = [];
+  for (var key in env) {
+    envPairs.push(key + '=' + env[key]);
+  }
+
+  _convertCustomFds(options);
+
+  return {
+    file: file,
+    args: args,
+    options: options,
+    envPairs: envPairs
+  };
+}
+
+
+var spawn = exports.spawn = function() {
+  var opts = normalizeSpawnArguments.apply(null, arguments);
+
+  var file = opts.file;
+  var args = opts.args;
+  var options = opts.options;
+  var envPairs = opts.envPairs;
+
+  var child = new ChildProcess();
+
+  child.spawn({
+    file: file,
+    args: args,
+    cwd: options ? options.cwd : null,
+    windowsVerbatimArguments: !!(options && options.windowsVerbatimArguments),
+    detached: !!(options && options.detached),
+    envPairs: envPairs,
+    stdio: options ? options.stdio : null,
+    uid: options ? options.uid : null,
+    gid: options ? options.gid : null
+  });
+
+  return child;
+};
+
+
+function maybeClose(subprocess) {
+  subprocess._closesGot++;
+
+  if (subprocess._closesGot == subprocess._closesNeeded) {
+    subprocess.emit('close', subprocess.exitCode, subprocess.signalCode);
+  }
+}
+
+
+function ChildProcess() {
+  EventEmitter.call(this);
+
+  
+  process.binding('tcp_wrap');
+  process.binding('pipe_wrap');
+
+  var self = this;
+
+  this._closesNeeded = 1;
+  this._closesGot = 0;
+  this.connected = false;
+
+  this.signalCode = null;
+  this.exitCode = null;
+  this.killed = false;
+  this.spawnfile = null;
+
+  this._handle = new Process();
+  this._handle.owner = this;
+
+  this._handle.onexit = function(exitCode, signalCode) {
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    var syscall = self.spawnfile ? 'spawn ' + self.spawnfile : 'spawn';
+    var err = (exitCode < 0) ? errnoException(exitCode, syscall) : null;
+
+    if (signalCode) {
+      self.signalCode = signalCode;
+    } else {
+      self.exitCode = exitCode;
+    }
+
+    if (self.stdin) {
+      self.stdin.destroy();
+    }
+
+    self._handle.close();
+    self._handle = null;
+
+    if (exitCode < 0) {
+      if (self.spawnfile)
+        err.path = self.spawnfile;
+
+      self.emit('error', err);
+    } else {
+      self.emit('exit', self.exitCode, self.signalCode);
+    }
+
+    
+    
+    
+    
+    
+    
+    process.nextTick(function() {
+      flushStdio(self);
+    });
+
+    maybeClose(self);
+  };
+}
+util.inherits(ChildProcess, EventEmitter);
+
+
+function flushStdio(subprocess) {
+  if (subprocess.stdio == null) return;
+  subprocess.stdio.forEach(function(stream, fd, stdio) {
+    if (!stream || !stream.readable || stream._consuming ||
+        stream._readableState.flowing)
+      return;
+    stream.resume();
+  });
+}
+
+
+
+function getHandleWrapType(stream) {
+  if (stream instanceof handleWraps.Pipe) return 'pipe';
+  if (stream instanceof handleWraps.TTY) return 'tty';
+  if (stream instanceof handleWraps.TCP) return 'tcp';
+  if (stream instanceof handleWraps.UDP) return 'udp';
+
+  return false;
+}
+
+
+ChildProcess.prototype.spawn = function(options) {
+  var self = this,
+      ipc,
+      ipcFd,
+      
+      stdio = options.stdio || 'pipe';
+
+  stdio = _validateStdio(stdio, false);
+
+  ipc = stdio.ipc;
+  ipcFd = stdio.ipcFd;
+  stdio = options.stdio = stdio.stdio;
+
+  if (!util.isUndefined(ipc)) {
+    
+    options.envPairs = options.envPairs || [];
+    options.envPairs.push('NODE_CHANNEL_FD=' + ipcFd);
+  }
+
+  this.spawnfile = options.file;
+
+  var err = this._handle.spawn(options);
+
+  
+  if (err === uv.UV_EAGAIN ||
+      err === uv.UV_EMFILE ||
+      err === uv.UV_ENFILE ||
+      err === uv.UV_ENOENT) {
+    process.nextTick(function() {
+      self._handle.onexit(err);
+    });
+    
+    
+    
+    
+    
+    if (err !== uv.UV_ENOENT) return err;
+  } else if (err) {
+    
+    stdio.forEach(function(stdio) {
+      if (stdio.type === 'pipe') {
+        stdio.handle.close();
+      }
+    });
+
+    this._handle.close();
+    this._handle = null;
+    throw errnoException(err, 'spawn');
+  }
+
+  this.pid = this._handle.pid;
+
+  stdio.forEach(function(stdio, i) {
+    if (stdio.type === 'ignore') return;
+
+    if (stdio.ipc) {
+      self._closesNeeded++;
+      return;
+    }
+
+    if (stdio.handle) {
+      
+      
+      stdio.socket = createSocket(self.pid !== 0 ? stdio.handle : null, i > 0);
+
+      if (i > 0 && self.pid !== 0) {
+        self._closesNeeded++;
+        stdio.socket.on('close', function() {
+          maybeClose(self);
+        });
+      }
+    }
+  });
+
+  this.stdin = stdio.length >= 1 && !util.isUndefined(stdio[0].socket) ?
+      stdio[0].socket : null;
+  this.stdout = stdio.length >= 2 && !util.isUndefined(stdio[1].socket) ?
+      stdio[1].socket : null;
+  this.stderr = stdio.length >= 3 && !util.isUndefined(stdio[2].socket) ?
+      stdio[2].socket : null;
+
+  this.stdio = stdio.map(function(stdio) {
+    return util.isUndefined(stdio.socket) ? null : stdio.socket;
+  });
+
+  
+  if (!util.isUndefined(ipc)) setupChannel(this, ipc);
+
+  return err;
+};
+
+
+ChildProcess.prototype.kill = function(sig) {
+  var signal;
+
+  if (!constants) {
+    constants = process.binding('constants');
+  }
+
+  if (sig === 0) {
+    signal = 0;
+  } else if (!sig) {
+    signal = constants['SIGTERM'];
+  } else {
+    signal = constants[sig];
+  }
+
+  if (util.isUndefined(signal)) {
+    throw new Error('Unknown signal: ' + sig);
+  }
+
+  if (this._handle) {
+    var err = this._handle.kill(signal);
+    if (err === 0) {
+      
+      this.killed = true;
+      return true;
+    }
+    if (err === uv.UV_ESRCH) {
+      
+    } else if (err === uv.UV_EINVAL || err === uv.UV_ENOSYS) {
+      
+      throw errnoException(err, 'kill');
+    } else {
+      
+      this.emit('error', errnoException(err, 'kill'));
+    }
+  }
+
+  
+  return false;
+};
+
+
+ChildProcess.prototype.ref = function() {
+  if (this._handle) this._handle.ref();
+};
+
+
+ChildProcess.prototype.unref = function() {
+  if (this._handle) this._handle.unref();
+};
+
+
+function lookupSignal(signal) {
+  if (typeof signal === 'number')
+    return signal;
+
+  if (!constants)
+    constants = process.binding('constants');
+
+  if (!(signal in constants))
+    throw new Error('Unknown signal: ' + signal);
+
+  return constants[signal];
+}
+
+
+function spawnSync() {
+  var opts = normalizeSpawnArguments.apply(null, arguments);
+
+  var options = opts.options;
+
+  var i;
+
+  options.file = opts.file;
+  options.args = opts.args;
+
+  if (options.killSignal)
+    options.killSignal = lookupSignal(options.killSignal);
+
+  options.stdio = _validateStdio(options.stdio || 'pipe', true).stdio;
+
+  if (options.input) {
+    var stdin = options.stdio[0] = util._extend({}, options.stdio[0]);
+    stdin.input = options.input;
+  }
+
+  
+  for (i = 0; i < options.stdio.length; i++) {
+    var input = options.stdio[i] && options.stdio[i].input;
+    if (input != null) {
+      var pipe = options.stdio[i] = util._extend({}, options.stdio[i]);
+      if (Buffer.isBuffer(input))
+        pipe.input = input;
+      else if (util.isString(input))
+        pipe.input = new Buffer(input, options.encoding);
+      else
+        throw new TypeError(util.format(
+            'stdio[%d] should be Buffer or string not %s',
+            i,
+            typeof input));
+    }
+  }
+
+  if (!spawn_sync)
+    spawn_sync = process.binding('spawn_sync');
+
+  var result = spawn_sync.spawn(options);
+
+  if (result.output && options.encoding) {
+    for (i = 0; i < result.output.length; i++) {
+      if (!result.output[i])
+        continue;
+      result.output[i] = result.output[i].toString(options.encoding);
+    }
+  }
+
+  result.stdout = result.output && result.output[1];
+  result.stderr = result.output && result.output[2];
+
+  if (result.error)
+    result.error = errnoException(result.error, 'spawnSync');
+
+  util._extend(result, opts);
+
+  return result;
+}
+exports.spawnSync = spawnSync;
+
+
+function checkExecSyncError(ret) {
+  if (ret.error || ret.status !== 0) {
+    var err = ret.error;
+    ret.error = null;
+
+    if (!err) {
+      var msg = 'Command failed: ' +
+                (ret.cmd ? ret.cmd : ret.args.join(' ')) +
+                (ret.stderr ? '\n' + ret.stderr.toString() : '');
+      err = new Error(msg);
+    }
+
+    util._extend(err, ret);
+    return err;
+  }
+
+  return false;
+}
+
+
+function execFileSync() {
+  var opts = normalizeSpawnArguments.apply(null, arguments);
+  var inheritStderr = !!!opts.options.stdio;
+
+  var ret = spawnSync(opts.file, opts.args.slice(1), opts.options);
+
+  if (inheritStderr)
+    process.stderr.write(ret.stderr);
+
+  var err = checkExecSyncError(ret);
+
+  if (err)
+    throw err;
+  else
+    return ret.stdout;
+}
+exports.execFileSync = execFileSync;
+
+
+function execSync() {
+  var opts = normalizeExecArgs.apply(null, arguments);
+  var inheritStderr = opts.options ? !!!opts.options.stdio : true;
+
+  var ret = spawnSync(opts.file, opts.args, opts.options);
+  ret.cmd = opts.cmd;
+
+  if (inheritStderr)
+    process.stderr.write(ret.stderr);
+
+  var err = checkExecSyncError(ret);
+
+  if (err)
+    throw err;
+  else
+    return ret.stdout;
+}
+exports.execSync = execSync;
